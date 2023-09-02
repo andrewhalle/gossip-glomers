@@ -102,13 +102,13 @@ impl Node {
     }
 
     /// Run the node, accepting and producing messages.
-    pub fn run(&mut self) -> Result<(), io::Error> {
+    pub fn run(mut self) -> Result<(), io::Error> {
         let stdin = io::stdin().lock();
         for msg in stdin.lines() {
             let msg: Message =
                 serde_json::from_str(&msg?).expect("we know we won't get invalid data");
             if let Some((r#type, mut handler)) = self.handlers.remove_entry(msg.r#type()) {
-                handler(self, msg)?;
+                handler(&mut self, msg)?;
                 self.handlers.insert(r#type, handler);
             }
         }
