@@ -13,22 +13,139 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// A function which can be registered to respond to a message with [`handle()`].
-type Handler = dyn FnMut(&mut Node, Message) -> Result<(), io::Error>;
+/// A message handler than we can register by calling [`rpc()`].
+type Callback = dyn Fn(Message) -> io::Result<()>;
 
-/// Implementors of distributed algorithms.
-pub struct Node {
+/// A user-defined node must at a minimum implement [`handle()`].
+pub trait Node {
+    /// Handle a message.
+    fn handle(&mut self, framework: &mut Framework, msg: Message) -> io::Result<()>;
+
+    /// Initialize a node. We provide a default empty implementation because some initialization
+    /// is handled by the framework and most [`Node`]s won't need this.
+    fn init(&mut self, _msg: &Message) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Implements runtime utilities that [`Node`]s can rely on.
+pub struct Framework {
     /// The id of this node. Initialized when we receive the `init` message.
     id: Option<String>,
 
     /// The next message id this node will produce.
     next_msg_id: u64,
 
-    /// The handlers that have been registered for this node.
-    handlers: HashMap<String, Box<Handler>>,
-
     /// A locked handle to the stdout owned by this node.
     stdout: StdoutLock<'static>,
+
+    /// Callback functions registered by sending a message with [`rpc()`].
+    callbacks: HashMap<u64, Box<Callback>>,
+}
+
+impl Framework {
+    /// Send a message to a node without expecting a response.
+    pub fn send(&mut self, to: String, body: Map<String, Value>) -> io::Result<()> {
+        let msg = Message {
+            src: self.node_id().to_owned(),
+            dest: to,
+            body,
+        };
+        self.stdout.write_all(
+            serde_json::to_string(&msg)
+                .expect("message will serialize")
+                .as_bytes(),
+        )?;
+        self.stdout.write_all(b"\n")?;
+        Ok(())
+    }
+
+    /// Send a message to a node expecting a response, registering a callback to be run when we
+    /// receive a response.
+    pub fn rpc(
+        &mut self,
+        to: String,
+        mut body: Map<String, Value>,
+        callback: Box<Callback>,
+    ) -> io::Result<()> {
+        let msg_id = self.produce_msg_id();
+        body.insert("msg_id".to_owned(), msg_id.into());
+        self.send(to, body)?;
+        self.callbacks.insert(msg_id, callback);
+        Ok(())
+    }
+
+    /// Get the current NodeId
+    ///
+    /// # Panics
+    ///     - If the node ID has not already been set.
+    pub fn node_id(&mut self) -> &str {
+        self.id.as_deref().unwrap()
+    }
+
+    /// Reply to a message.
+    pub fn reply(&mut self, msg: Message, mut body: Map<String, Value>) -> io::Result<()> {
+        if let Some(msg_id) = msg.msg_id() {
+            body.insert("in_reply_to".to_owned(), msg_id.into());
+        }
+        body.insert("msg_id".to_owned(), self.produce_msg_id().into());
+        self.send(msg.src, body)
+    }
+
+    /// Create a new framework.
+    fn new() -> Framework {
+        Framework {
+            id: None,
+            next_msg_id: 1,
+            stdout: io::stdout().lock(),
+            callbacks: HashMap::default(),
+        }
+    }
+
+    /// Run the node, accepting and producing messages.
+    pub fn run(mut node: impl Node) -> Result<(), io::Error> {
+        let mut framework = Framework::new();
+        let stdin = io::stdin().lock();
+        for msg in stdin.lines() {
+            let msg: Message =
+                serde_json::from_str(&msg?).expect("we know we won't get invalid data");
+            match (msg.r#type(), msg.in_reply_to()) {
+                ("init", _) => {
+                    node.init(&msg)?;
+                    framework.init(msg)?;
+                }
+                (_, Some(msg_id)) => {
+                    if let Some(handler) = framework.callbacks.remove(&msg_id) {
+                        handler(msg)?;
+                    }
+                }
+                _ => node.handle(&mut framework, msg)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle the `init` message.
+    fn init(&mut self, msg: Message) -> io::Result<()> {
+        self.id = msg
+            .body
+            .get("node_id")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_owned());
+        let mut body = Map::new();
+        body.insert("type".to_string(), "init_ok".into());
+        self.reply(msg, body)
+    }
+
+    /// Make a new `msg_id` unique to this process.
+    fn produce_msg_id(&mut self) -> u64 {
+        if self.next_msg_id == u64::MAX {
+            panic!("too many ids generated");
+        }
+        let id = self.next_msg_id;
+        self.next_msg_id += 1;
+        id
+    }
 }
 
 /// A message from another [`Node`].
@@ -46,7 +163,7 @@ pub struct Message {
 
 impl Message {
     /// Return the `type` field (nonoptional).
-    fn r#type(&self) -> &str {
+    pub fn r#type(&self) -> &str {
         self.body
             .get("type")
             .expect("`type` is required")
@@ -54,92 +171,17 @@ impl Message {
             .expect("`type` is always string")
     }
 
-    /// Return the `msg_id` field (nonoptional).
-    fn msg_id(&self) -> u64 {
+    /// Return the `msg_id` field (optional).
+    fn msg_id(&self) -> Option<u64> {
         self.body
             .get("msg_id")
-            .expect("`msg_id` is required")
-            .as_u64()
-            .expect("`msg_id` is always u64")
-    }
-}
-
-impl Default for Node {
-    fn default() -> Node {
-        Node::new()
-    }
-}
-
-impl Node {
-    /// Create a new node.
-    pub fn new() -> Node {
-        let mut node = Node {
-            handlers: HashMap::new(),
-            stdout: io::stdout().lock(),
-            id: None,
-            next_msg_id: 1,
-        };
-        node.handle(
-            "init",
-            Box::new(|node, msg| {
-                node.id = msg
-                    .body
-                    .get("node_id")
-                    .and_then(|value| value.as_str())
-                    .map(|s| s.to_owned());
-                let mut body = Map::new();
-                body.insert("type".to_string(), "init_ok".into());
-                node.reply(msg, body)
-            }),
-        );
-        node
+            .map(|value| value.as_u64().expect("`msg_id` is always u64"))
     }
 
-    /// Register a handler function.
-    pub fn handle(&mut self, message_name: impl Into<String>, handler: Box<Handler>) -> &mut Node {
-        self.handlers.insert(message_name.into(), handler);
-        self
-    }
-
-    /// Run the node, accepting and producing messages.
-    pub fn run(&mut self) -> Result<(), io::Error> {
-        let stdin = io::stdin().lock();
-        for msg in stdin.lines() {
-            let msg: Message =
-                serde_json::from_str(&msg?).expect("we know we won't get invalid data");
-            if let Some((r#type, mut handler)) = self.handlers.remove_entry(msg.r#type()) {
-                handler(self, msg)?;
-                self.handlers.insert(r#type, handler);
-            }
-        }
-        Ok(())
-    }
-
-    /// Reply to a message.
-    pub fn reply(&mut self, msg: Message, mut body: Map<String, Value>) -> Result<(), io::Error> {
-        dbg!(&body);
-        body.insert("in_reply_to".to_owned(), msg.msg_id().into());
-        body.insert("msg_id".to_owned(), self.produce_msg_id().into());
-        let msg = Message {
-            src: msg.dest,
-            dest: msg.src,
-            body,
-        };
-        self.stdout.write_all(
-            serde_json::to_string(&msg)
-                .expect("message will serialize")
-                .as_bytes(),
-        )?;
-        self.stdout.write_all(b"\n")
-    }
-
-    /// Make a new `msg_id` unique to this node.
-    fn produce_msg_id(&mut self) -> u64 {
-        if self.next_msg_id == u64::MAX {
-            panic!("too many ids generated");
-        }
-        let id = self.next_msg_id;
-        self.next_msg_id += 1;
-        id
+    /// Return the `in_reply_to` field (optional).
+    fn in_reply_to(&self) -> Option<u64> {
+        self.body
+            .get("in_reply_to")
+            .map(|value| value.as_u64().expect("`in_reply_to` is always u64"))
     }
 }
