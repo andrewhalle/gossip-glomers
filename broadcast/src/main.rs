@@ -11,15 +11,14 @@ use maelstrom::Node;
 use serde_json::{Map, Value};
 
 fn main() {
-    let mut node = Node::new();
-    let seen: Rc<RefCell<HashSet<u64>>> = Rc::default();
+    let seen = HashSet<u64> = HashSet::default();
+    let mut node = Node::with_state(seen);
     node.handle(
         "broadcast",
         Box::new({
             let seen = Rc::clone(&seen);
             move |node, msg| {
-                let mut seen = seen.borrow_mut();
-                seen.insert(
+                node.state().insert(
                     msg.body
                         .get("message")
                         .and_then(Value::as_u64)

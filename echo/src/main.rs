@@ -7,17 +7,17 @@
 
 use std::io;
 
-use maelstrom::{Message, Node};
+use maelstrom::{Message, Node, NodeImpl};
 
 /// Return the message unchanged.
-fn echo(node: &mut Node, msg: Message) -> Result<(), io::Error> {
+fn echo(node: &mut dyn Node<()>, msg: Message) -> Result<(), io::Error> {
     let mut body = msg.body.clone();
     body.insert("type".to_owned(), "echo_ok".into());
     node.reply(msg, body)
 }
 
 fn main() {
-    let mut node = Node::new();
+    let mut node = NodeImpl::new();
     node.handle("echo", Box::new(echo));
     node.run().unwrap();
 }
