@@ -5,7 +5,7 @@
 #![deny(missing_docs)]
 #![deny(clippy::missing_docs_in_private_items)]
 
-use std::io;
+use std::sync::Arc;
 
 use maelstrom::{Framework, Message, Node};
 use serde_json::Map;
@@ -16,7 +16,7 @@ struct UniqueIdNode;
 
 impl UniqueIdNode {
     /// Generate a unique ID.
-    fn generate(&mut self, framework: &mut Framework, msg: Message) -> io::Result<()> {
+    fn generate(&mut self, framework: &Framework, msg: Message) {
         let mut body = Map::new();
         body.insert("type".to_string(), "generate_ok".into());
         body.insert("id".to_string(), Uuid::new_v4().to_string().into());
@@ -25,14 +25,13 @@ impl UniqueIdNode {
 }
 
 impl Node for UniqueIdNode {
-    fn handle(&mut self, framework: &mut Framework, msg: Message) -> io::Result<()> {
-        match msg.r#type() {
-            "generate" => self.generate(framework, msg),
-            _ => Ok(()),
+    fn handle(&mut self, framework: Arc<Framework>, msg: Message) {
+        if msg.r#type() == "generate" {
+            self.generate(&framework, msg);
         }
     }
 }
 
 fn main() {
-    Framework::run(UniqueIdNode).unwrap();
+    Framework::run(UniqueIdNode)
 }

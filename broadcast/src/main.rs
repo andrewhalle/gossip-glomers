@@ -5,7 +5,7 @@
 #![deny(missing_docs)]
 #![deny(clippy::missing_docs_in_private_items)]
 
-use std::{collections::HashSet, io};
+use std::{collections::HashSet, sync::Arc};
 
 use maelstrom::{Framework, Message, Node};
 use serde_json::{Map, Value};
@@ -29,28 +29,28 @@ impl BroadcastNode {
     }
 
     /// Broadcast a message to all peers.
-    fn broadcast(&mut self, framework: &mut Framework, msg: Message) -> io::Result<()> {
+    fn broadcast(&mut self, framework: Arc<Framework>, msg: Message) {
         let message = msg
             .body
             .get("message")
             .and_then(Value::as_u64)
             .expect("`message` is required and must be a u64");
         if self.seen.insert(message) {
-            let mut body = Map::new();
-            body.insert("type".to_owned(), "broadcast_ok".into());
-            framework.reply(msg, body)?;
             for neighbor in &self.neighbors {
+                let framework = Arc::clone(&framework);
                 let mut body = Map::new();
                 body.insert("type".to_owned(), "broadcast".into());
                 body.insert("message".to_owned(), message.into());
-                framework.send(neighbor.to_owned(), body)?;
+                framework.send_with_retries(neighbor.to_owned(), body);
             }
         }
-        Ok(())
+        let mut body = Map::new();
+        body.insert("type".to_owned(), "broadcast_ok".into());
+        framework.reply(msg, body)
     }
 
     /// Reply with seen message IDs.
-    fn read(&mut self, framework: &mut Framework, msg: Message) -> io::Result<()> {
+    fn read(&mut self, framework: Arc<Framework>, msg: Message) {
         let mut body = Map::new();
         body.insert("type".to_owned(), "read_ok".into());
         body.insert("messages".to_owned(), self.seen.iter().copied().collect());
@@ -58,14 +58,14 @@ impl BroadcastNode {
     }
 
     /// Set the topology of our neighbors.
-    fn topology(&mut self, framework: &mut Framework, msg: Message) -> io::Result<()> {
+    fn topology(&mut self, framework: Arc<Framework>, msg: Message) {
         self.neighbors = msg
             .body
             .get("topology")
             .expect("topology will exist")
             .as_object()
             .expect("topology will be an object")
-            .get(framework.node_id())
+            .get(&framework.node_id())
             .expect("node_id will exist in topology")
             .as_array()
             .expect("neighbors will be an array")
@@ -84,17 +84,17 @@ impl BroadcastNode {
 }
 
 impl Node for BroadcastNode {
-    fn handle(&mut self, framework: &mut Framework, msg: Message) -> io::Result<()> {
+    fn handle(&mut self, framework: Arc<Framework>, msg: Message) {
         match msg.r#type() {
             "broadcast" => self.broadcast(framework, msg),
             "read" => self.read(framework, msg),
             "topology" => self.topology(framework, msg),
-            _ => Ok(()),
+            _ => {}
         }
     }
 }
 
 fn main() {
     let node = BroadcastNode::new();
-    Framework::run(node).unwrap();
+    Framework::run(node)
 }
